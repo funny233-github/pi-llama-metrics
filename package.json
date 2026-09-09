@@ -1,0 +1,14 @@
+{
+  "name": "pi-llama-metrics-display",
+  "version": "1.0.0",
+  "description": "Pi extension to display llama.cpp metrics (prefill speed, generation speed, progress)",
+  "main": "index.ts",
+  "type": "module",
+  "scripts": {
+    "install": "node install.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
