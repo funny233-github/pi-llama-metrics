@@ -7,302 +7,474 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, Container } from "@earendil-works/pi-tui";
-import fs from "node:fs";
+
+// ─── Type Definitions ─────────────────────────────────────────────────────────
+
+interface LlamaCppSSEDelta {
+  content?: string;
+  reasoning_content?: string;
+  reasoning?: string;
+  tool_calls?: Array<{
+    function?: {
+      name?: string;
+      arguments?: string;
+    };
+  }>;
+}
+
+interface LlamaCppSSEChunk {
+  prompt_progress?: {
+    processed: number;
+    total: number;
+    time_ms: number;
+  };
+  choices?: Array<{
+    delta?: LlamaCppSSEDelta;
+  }>;
+  usage?: {
+    completion_tokens?: number;
+  };
+}
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
 let currentProgress: { total?: number; processed?: number; time_ms?: number } | null = null;
 let prevProcessed = 0;
 let prevTimeMs = 0;
-let hasReceivedPrefill = false;
+let isGenerating = false;
 
-const rateHistory: { processed: number; tps: number }[] = [];
-const MAX_RATE_POINTS = 20;
 let uiRef: any = null;
 let hasUIRef = false;
 let originalFetch: typeof fetch | null = null;
 
 // Generation tracking
-let generatedTokens = 0;
+let generatedTokens = 0;           // Cumulative tokens across all rounds
+let generationBaseTokens = 0;      // Tokens at start of current generation round
 let generationStartTime: number | null = null;
 
 // Latest metrics for widget
 let latestStreamingMetrics: LlamaMetrics | null = null;
 
-// ─── Metrics state ───────────────────────────────────────────────────────────
+// Window smoothing for real-time TPS
+const windowSizeMs = 1000;
+let tokenWindow: { tokens: number; time: number }[] = [];
+let prefillWindow: { processed: number; time: number }[] = [];
+let usageApplied = false;
+let usageJustApplied = false;  // Flag for first chunk after usage
 
 interface LlamaMetrics {
-	prefillSpeed?: number;
-	generationSpeed?: number;
-	prefillTime?: number;
-	generationTime?: number;
-	promptTokens?: number;
-	generatedTokens?: number;
-	lastUpdate?: number;
+  generationSpeed?: number;
+  lastUpdate?: number;
 }
 
 let lastDisplay: string | null = null;
 let currentModelId: string | null = null;
+let statusLineVisible = true;   // Default visible (no toggle needed for decode info)
+let lastPrefillTps = 0;         // For ETA calculation
+
+// Reset all state at start of each new request
+function resetGenerationState() {
+  isGenerating = false;
+  generationStartTime = null;
+  generationBaseTokens = generatedTokens;  // Preserve cumulative, set baseline
+  currentProgress = null;
+  prevProcessed = 0;
+  prevTimeMs = 0;
+  latestStreamingMetrics = null;  // Clear metrics to avoid cross-round contamination
+  lastDisplay = null;             // Clear display cache
+  tokenWindow.length = 0;           // Clear window for new stream
+  prefillWindow.length = 0;         // Clear prefill window
+  usageApplied = false;             // Reset usage flag
+  usageJustApplied = false;         // Reset flag
+  lastPrefillTps = 0;               // Reset ETA calculation basis
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function formatDuration(seconds: number): string {
-	if (seconds < 60) return `${Math.round(seconds)}s`;
-	const m = Math.floor(seconds / 60);
-	const s = Math.round(seconds % 60);
-	return `${m}m ${s}s`;
-}
-
-function formatTokensPerSec(processed: number, timeMs: number): string {
-	const secs = timeMs / 1000;
-	if (secs <= 0) return "";
-	const rate = processed / secs;
-	return `${rate.toFixed(1)} tok/s`;
-}
+// ANSI gray (bright black), some terminals render as dark gray
+const GRAY = "\x1b[90m";
+const RESET = "\x1b[0m";
 
 function formatTps(speed: number | undefined): string {
-	if (speed === undefined) return "";
-	return `${speed.toFixed(1)} tok/s`;
+  if (speed === undefined) return "";
+  return `${speed.toFixed(1)} tok/s`;
+}
+
+// Better token estimation for CJK and code
+function estimateTokens(content: string): number {
+  let cjk = 0;
+  let other = 0;
+  for (const char of content) {
+    const code = char.codePointAt(0) ?? 0;
+    const isCJK =
+      (code >= 0x4e00 && code <= 0x9fff) ||   // CJK Unified Ideographs
+      (code >= 0x3040 && code <= 0x30ff) ||   // Hiragana + Katakana
+      (code >= 0xac00 && code <= 0xd7af) ||   // Hangul
+      (code >= 0x3400 && code <= 0x4dbf) ||   // CJK Extension A
+      (code >= 0x3000 && code <= 0x303f) ||   // ✅ CJK 标点
+      (code >= 0xff00 && code <= 0xffef);     // ✅ 全角字符
+    if (isCJK) cjk++;
+    else other++;
+  }
+  // CJK 约 1 字符 1 token，其他约 4 字符 1 token
+  return Math.max(1, Math.round(cjk + other / 4));
 }
 
 // ─── SSE Stream Interceptor ──────────────────────────────────────────────────
 
-interface SSEChunk {
-	prompt_progress?: {
-		processed: number;
-		total: number;
-		time_ms: number;
-	};
-	completion_text?: string;
-}
+function parseSSEEvent(line: string): LlamaCppSSEChunk | null {
+  if (!line.startsWith("data: ")) return null;
+  const jsonStr = line.slice(6);
+  if (jsonStr === "[DONE]") return null;
 
-function parseSSEEvent(line: string): SSEChunk | null {
-	if (!line.startsWith("data: ")) return null;
-	const jsonStr = line.slice(6);
-	if (jsonStr === "[DONE]") return null;
-
-	try {
-		return JSON.parse(jsonStr) as SSEChunk;
-	} catch {
-		return null;
-	}
+  try {
+    return JSON.parse(jsonStr) as LlamaCppSSEChunk;
+  } catch {
+    return null;
+  }
 }
 
 function handleProgressEvent(p: { processed: number; total: number; time_ms: number }) {
-	if (currentProgress) {
-		prevProcessed = currentProgress.processed ?? 0;
-		prevTimeMs = currentProgress.time_ms ?? 0;
-	}
-	currentProgress = p;
-	hasReceivedPrefill = true;
+  if (currentProgress) {
+    prevProcessed = currentProgress.processed ?? 0;
+    prevTimeMs = currentProgress.time_ms ?? 0;
+  }
+  currentProgress = p;
 
-	const deltaP = (p.processed ?? 0) - prevProcessed;
-	const deltaT = (p.time_ms ?? 0) - prevTimeMs;
-	if (deltaT > 0 && deltaP > 0) {
-		const tps = deltaP / (deltaT / 1000);
-		rateHistory.push({ processed: p.processed ?? 0, tps });
-		if (rateHistory.length > MAX_RATE_POINTS) {
-			rateHistory.shift();
-		}
+  // First check if prefill is complete - exit early if so
+  const prefillDone = p.total !== undefined && p.processed >= p.total;
 
-		// Update status line in real-time during prefill
-		if (currentCtx && currentModelId) {
-			const metrics: LlamaMetrics = {
-				prefillSpeed: tps,
-				promptTokens: p.processed ?? 0,
-				lastUpdate: Date.now()
-			};
-			updateStatus(currentCtx, currentModelId, metrics);
-		}
-	}
+  if (prefillDone) {
+    if (!isGenerating) {
+      // Short prompt scenario: only one progress event, derive TPS from p.time_ms
+      if (lastPrefillTps === 0 && p.time_ms > 0 && p.processed > 0) {
+        lastPrefillTps = (p.processed / p.time_ms) * 1000;
+        // Note: prefill has ended at this point, working message will be cleared,
+        // lastPrefillTps is retained for next ETA usage (though meaningless for this round)
+      }
+      isGenerating = true;
+      updateWorkingMessage();   // Clear progress bar
+    }
+    return;   // Skip TPS calculation for completion event
+  }
+
+  if (!isGenerating) {
+    const deltaP = (p.processed ?? 0) - prevProcessed;
+    const deltaT = (p.time_ms ?? 0) - prevTimeMs;
+    if (deltaT > 0 && deltaP > 0) {
+      // Window smoothing on llama.cpp internal clock
+      prefillWindow.push({ processed: p.processed ?? 0, time: p.time_ms });
+      const maxTime = p.time_ms;
+      while (prefillWindow.length > 0 && maxTime - prefillWindow[0].time > windowSizeMs) {
+        prefillWindow.shift();
+      }
+
+      let tps = 0;
+      if (prefillWindow.length >= 2) {
+        const first = prefillWindow[0];
+        const last = prefillWindow[prefillWindow.length - 1];
+        const dP = last.processed - first.processed;
+        const dT = last.time - first.time;
+        if (dT > 0 && dP > 0) {
+          tps = (dP / dT) * 1000;
+        }
+      }
+      if (tps === 0) {
+        tps = deltaP / (deltaT / 1000);
+      }
+
+      lastPrefillTps = tps;
+      updateWorkingMessage();   // Only called once per TPS update (mutually exclusive with prefillDone branch)
+    }
+  }
 }
 
-function handleCompletionText(text: string) {
-	// Simple token counting (approximate)
-	const tokens = text.trim().split(/\s+/).length;
-	if (tokens === 0) return;
+// Update working message with prefill progress bar, speed, and ETA
+function updateWorkingMessage(): void {
+  if (!uiRef || !hasUIRef) return;
 
-	generatedTokens += tokens;
+  // Use >= to catch processed > total boundary case
+  if (currentProgress?.total !== undefined && currentProgress.processed !== undefined && currentProgress.processed >= currentProgress.total) {
+    uiRef.setWorkingMessage();
+    return;
+  }
 
-	// Track generation start time on first token
-	if (!generationStartTime) {
-		generationStartTime = Date.now();
-	}
+  if (currentProgress && currentProgress.total && currentProgress.processed !== undefined) {
+    // Clamp percentage to [0, 100] to prevent negative repeat
+    const pct = Math.min(100, Math.max(0, (currentProgress.processed / currentProgress.total) * 100));
+    const barWidth = 12;   // Shrink bar width to make room for speed
+    const filled = Math.min(barWidth, Math.max(0, Math.round((pct / 100) * barWidth)));
+    const bar = "█".repeat(filled) + "░".repeat(barWidth - filled);
 
-	// Calculate generation TPS
-	const elapsed = Date.now() - generationStartTime;
-	if (elapsed > 0) {
-		const tps = (generatedTokens / elapsed) * 1000;
-		if (currentCtx && currentModelId) {
-			const metrics: LlamaMetrics = {
-				generationSpeed: tps,
-				generatedTokens: generatedTokens,
-				lastUpdate: Date.now()
-			};
-			updateStatus(currentCtx, currentModelId, metrics);
-		}
-	}
+    // Speed string
+    let speedStr = "";
+    if (lastPrefillTps > 0) {
+      speedStr = ` ${lastPrefillTps.toFixed(0)} tok/s`;
+    }
+
+    // ETA calculation with clamped remaining
+    let etaStr = "";
+    if (lastPrefillTps > 0) {
+      const remaining = Math.max(0, currentProgress.total - currentProgress.processed);
+      const etaSec = remaining / lastPrefillTps;
+      if (etaSec < 60) {
+        etaStr = ` ETA: ${etaSec.toFixed(1)}s`;
+      } else {
+        const m = Math.floor(etaSec / 60);
+        const s = Math.round(etaSec % 60);
+        etaStr = ` ETA: ${m}m${s}s`;
+      }
+    }
+
+    uiRef.setWorkingMessage(`PREFILL: ${bar} ${pct.toFixed(0).padStart(3)}%${speedStr}${etaStr}`);
+  } else {
+    uiRef.setWorkingMessage();
+  }
+}
+
+function handleCompletionText(content: string) {
+  // Use more accurate token estimation for CJK and code
+  const tokens = estimateTokens(content);
+  generatedTokens += tokens;
+
+  // Track generation start time on first token (avoid first-token latency)
+  if (!generationStartTime) {
+    isGenerating = true;  // Double insurance: mark as generating even without prefill events
+    generationStartTime = Date.now();
+    generationBaseTokens = generatedTokens - tokens;  // Baseline for this round
+  }
+
+  // First chunk after usage: only reset window baseline, don't calculate TPS
+  if (usageJustApplied) {
+    usageJustApplied = false;
+    tokenWindow.length = 0;
+    tokenWindow.push({ tokens: generatedTokens, time: Date.now() });
+    return;
+  }
+
+  const now = Date.now();
+
+  // Window smoothing for real-time TPS (store cumulative values)
+  tokenWindow.push({ tokens: generatedTokens, time: now });
+  // Remove old entries outside window
+  while (tokenWindow.length > 0 && now - tokenWindow[0].time > windowSizeMs) {
+    tokenWindow.shift();
+  }
+
+  // Calculate smoothed TPS from recent window
+  let smoothedTps = 0;
+  if (tokenWindow.length >= 2) {
+    const first = tokenWindow[0];
+    const last = tokenWindow[tokenWindow.length - 1];
+    const deltaTokens = last.tokens - first.tokens;
+    const deltaMs = last.time - first.time;
+    if (deltaMs > 0 && deltaTokens > 0) {
+      smoothedTps = (deltaTokens / deltaMs) * 1000;
+    }
+  }
+
+  // Fallback to average from start if window too small
+  if (smoothedTps === 0 && generationStartTime) {
+    const elapsedMs = now - generationStartTime;
+    if (elapsedMs > 0) {
+      const roundTokens = generatedTokens - generationBaseTokens;
+      smoothedTps = (roundTokens / elapsedMs) * 1000;
+    }
+  }
+
+  // Only send generationSpeed
+  if (currentCtx) {
+    const metrics: LlamaMetrics = {
+      generationSpeed: smoothedTps,
+      lastUpdate: now
+    };
+    updateStatus(currentCtx, metrics);
+  }
+
 }
 
 function captureTimings(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
-	const reader = body.getReader();
-	let buffer = "";
-	const decoder = new TextDecoder();
+  const reader = body.getReader();
+  let buffer = "";
+  const decoder = new TextDecoder();
 
-	return new ReadableStream({
-		async start(controller) {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
+  return new ReadableStream({
+    async start(controller) {
+      // ✅ Reset generation state for each new response stream (handles multiple requests per round)
+      resetGenerationState();
 
-				buffer += decoder.decode(value, { stream: true });
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-				for (const line of lines) {
-					const chunk = parseSSEEvent(line);
-					if (!chunk) continue;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
 
-					if (chunk.prompt_progress) {
-						handleProgressEvent(chunk.prompt_progress);
-						updateWorkingMessage();
-					}
-					if (chunk.completion_text) {
-						handleCompletionText(chunk.completion_text);
-					}
-				}
+        for (const line of lines) {
+          const chunk = parseSSEEvent(line);
+          if (!chunk) continue;
 
-				controller.enqueue(value);
-			}
-			controller.close();
-		},
-		cancel(reason?: any) {
-			reader.cancel(reason);
-		},
-	});
+          if (chunk.prompt_progress) {
+            handleProgressEvent(chunk.prompt_progress);
+            // No need to call updateWorkingMessage() here - already done inside handleProgressEvent
+          }
+
+          // Extract all output types from choices[0].delta
+          if (chunk.choices && chunk.choices.length > 0) {
+            const delta = chunk.choices[0].delta;
+            if (delta) {
+              let combined = "";
+
+              // 1. Text output
+              if (typeof delta.content === "string" && delta.content.length > 0) {
+                combined += delta.content;
+              }
+
+              // 2. Thinking/reasoning content (DeepSeek-R1, QwQ, etc.)
+              if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+                combined += delta.reasoning_content;
+              }
+              if (typeof delta.reasoning === "string" && delta.reasoning.length > 0) {
+                combined += delta.reasoning;
+              }
+
+              // 3. Tool call parameters (streaming JSON fragments)
+              if (Array.isArray(delta.tool_calls)) {
+                for (const tc of delta.tool_calls) {
+                  const args = tc?.function?.arguments;
+                  if (typeof args === "string" && args.length > 0) {
+                    combined += args;
+                  }
+                  // Some implementations send function name separately, also counts as token-level output
+                  const name = tc?.function?.name;
+                  if (typeof name === "string" && name.length > 0) {
+                    combined += name;
+                  }
+                }
+              }
+
+              // 4. Unified processing via handleCompletionText
+              if (combined.length > 0) {
+                handleCompletionText(combined);
+              }
+            }
+          }
+
+          // Use real token count from usage event for accuracy (only once)
+          if (!usageApplied && chunk.usage?.completion_tokens !== undefined) {
+            usageApplied = true;
+            usageJustApplied = true;  // Mark first chunk after usage
+            const realRoundTokens = chunk.usage.completion_tokens;
+
+            // 1. First calculate final average TPS for this round using old baseline + real value
+            let finalTps: number | undefined;
+            if (generationStartTime !== null) {
+              const elapsedMs = Date.now() - generationStartTime;
+              if (elapsedMs > 0) {
+                finalTps = (realRoundTokens / elapsedMs) * 1000;
+              }
+            }
+
+            // 2. Update cumulative tokens (maintain cross-round cumulative semantics)
+            generatedTokens = generationBaseTokens + realRoundTokens;
+
+            // 3. Reset window, but retain generationStartTime / generationBaseTokens
+            //    This way if there are more chunks later, average is still calculated from round start, won't show 0
+            const now = Date.now();
+            tokenWindow.length = 0;
+            tokenWindow.push({ tokens: generatedTokens, time: now });
+
+            // 4. Display final TPS
+            if (finalTps !== undefined && currentCtx) {
+              updateStatus(currentCtx, {
+                generationSpeed: finalTps,
+                lastUpdate: now,
+              });
+            }
+          }
+        }
+
+        controller.enqueue(value);
+      }
+      controller.close();
+    },
+    cancel(reason?: any) {
+      // Clear working message on interruption to avoid progress bar residue
+      if (uiRef && hasUIRef) {
+        uiRef.setWorkingMessage();
+      }
+      reader.cancel(reason);
+    },
+  });
 }
 
 // ─── Fetch Interception ──────────────────────────────────────────────────────
 
 function isLlamaCppRequest(input: any): boolean {
-	const url = typeof input === "string" ? input : input?.url;
-	if (typeof url !== "string") return false;
-	if (!url.includes("/chat/completions")) return false;
+  const url = typeof input === "string" ? input : input?.url;
+  if (typeof url !== "string") return false;
+  if (!url.includes("/chat/completions")) return false;
 
-	if (!llamaCppUrl) {
-		let hostPart = url.replace(/https?:\/\//, "").split("/")[0];
-		llamaCppUrl = `http://${hostPart}/v1`;
-	}
+  if (!llamaCppUrl) {
+    let hostPart = url.replace(/https?:\/\//, "").split("/")[0];
+    llamaCppUrl = `http://${hostPart}/v1`;
+  }
 
-	return url.includes(llamaCppUrl.replace(/https?:\/\//, "").replace(/^\/+/, ""));
+  return url.includes(llamaCppUrl.replace(/https?:\/\//, "").replace(/^\/+/, ""));
 }
 
 function ensureStreamOptions(input: any, init?: any): void {
-	try {
-		let body = init?.body;
-		if (!body) return;
+  try {
+    let body = init?.body;
+    if (!body) return;
 
-		const isString = typeof body === "string";
-		const p = isString ? JSON.parse(body) : { ...body };
+    const isString = typeof body === "string";
+    const p = isString ? JSON.parse(body) : { ...body };
 
-		if (!p.stream_options) {
-			p.stream_options = { include_usage: true };
-		} else if (!p.stream_options.include_usage) {
-			p.stream_options.include_usage = true;
-		}
+    if (!p.stream_options) {
+      p.stream_options = { include_usage: true };
+    } else if (!p.stream_options.include_usage) {
+      p.stream_options.include_usage = true;
+    }
 
-		if (p.stream && !p.return_progress) {
-			p.return_progress = true;
-		}
+    if (p.stream && !p.return_progress) {
+      p.return_progress = true;
+    }
 
-		const newBody = JSON.stringify(p);
-		if (isString) {
-			init.body = newBody;
-		} else {
-			Object.assign(body, p);
-		}
-	} catch {
-		// Ignore parse errors
-	}
+    const newBody = JSON.stringify(p);
+    if (isString) {
+      init.body = newBody;
+    } else {
+      Object.assign(body, p);
+    }
+  } catch {
+    // Ignore parse errors
+  }
 }
 
 // ─── Display builders ────────────────────────────────────────────────────────
 
-function buildDisplayString(metrics: LlamaMetrics, modelId: string): string {
-	const parts = [];
-
-	if (metrics.prefillSpeed) parts.push(`PREFILL: ${formatTps(metrics.prefillSpeed)}`);
-	if (metrics.generationSpeed) parts.push(`GENERATION: ${formatTps(metrics.generationSpeed)}`);
-	if (metrics.promptTokens !== undefined) {
-		parts.push(`PREFILL TOKENS: ${metrics.promptTokens}`);
-	}
-	if (metrics.generatedTokens !== undefined) {
-		parts.push(`GENERATED TOKENS: ${metrics.generatedTokens}`);
-	}
-
-	if (parts.length === 0) return `MODEL: ${modelId}`;
-	return `MODEL: ${modelId} | ${parts.join(" | ")}`;
+function buildDisplayString(metrics: LlamaMetrics): string {
+  if (metrics.generationSpeed !== undefined) {
+    return `${GRAY}${formatTps(metrics.generationSpeed)}${RESET}`;
+  }
+  return "";
 }
 
-function buildWidgetContent(metrics: LlamaMetrics, modelId: string, theme: any) {
-	const container = new Container();
+function updateStatus(ctx: ExtensionContext, metrics: LlamaMetrics) {
+  // Preserve latestStreamingMetrics for widget command
+  latestStreamingMetrics = latestStreamingMetrics
+    ? { ...latestStreamingMetrics, ...metrics }
+    : metrics;
 
-	const modelText = new Text(`MODEL: ${modelId}`, 1, 0);
-	container.addChild(modelText);
+  if (!statusLineVisible) return;
 
-	if (metrics.prefillSpeed) {
-		const prefillText = new Text(`PREFILL SPEED: ${formatTps(metrics.prefillSpeed)}`, 1, 0);
-		container.addChild(prefillText);
-	}
-
-	if (metrics.generationSpeed) {
-		const genText = new Text(`GENERATION SPEED: ${formatTps(metrics.generationSpeed)}`, 1, 0);
-		container.addChild(genText);
-	}
-
-	if (metrics.promptTokens !== undefined) {
-		const tokensText = new Text(`PREFILL TOKENS: ${metrics.promptTokens}`, 1, 0);
-		container.addChild(tokensText);
-	}
-
-	if (metrics.generatedTokens !== undefined) {
-		const genTokensText = new Text(`GENERATED TOKENS: ${metrics.generatedTokens}`, 1, 0);
-		container.addChild(genTokensText);
-	}
-
-	if (container.children.length === 0) {
-		const emptyText = new Text("NO METRICS AVAILABLE", 1, 0);
-		container.addChild(emptyText);
-	}
-
-	return container;
-}
-
-function updateStatus(ctx: ExtensionContext, modelId: string, metrics: LlamaMetrics) {
-	// Store for widget access
-	latestStreamingMetrics = { ...metrics };
-
-	const display = buildDisplayString(metrics, modelId);
-	if (display !== lastDisplay && ctx.hasUI) {
-		lastDisplay = display;
-		ctx.ui.setStatus("pi-llama-metrics", display);
-	}
-}
-
-function updateWorkingMessage(): void {
-	if (!uiRef || !hasUIRef) return;
-	
-	if (currentProgress?.total && currentProgress.processed === currentProgress.total) {
-		uiRef.setWorkingMessage();
-	} else if (currentProgress && currentProgress.total && currentProgress.processed !== undefined) {
-		const pct = (currentProgress.processed / currentProgress.total) * 100;
-		const filled = Math.round((pct / 100) * 20);
-		const bar = "█".repeat(filled) + "░".repeat(20 - filled);
-		const msg = `PREFILL: ${bar} ${pct.toFixed(0).padStart(3)}%`;
-		uiRef.setWorkingMessage(msg);
-	} else {
-		uiRef.setWorkingMessage();
-	}
+  const display = buildDisplayString(latestStreamingMetrics);
+  if (display !== "" && display !== lastDisplay && ctx.hasUI) {
+    lastDisplay = display;
+    ctx.ui.setStatus("pi-llama-metrics", display);
+  }
 }
 
 // ─── Extension ───────────────────────────────────────────────────────────────
@@ -310,142 +482,127 @@ function updateWorkingMessage(): void {
 let currentCtx: ExtensionContext | null = null;
 let llamaCppUrl: string | null = null;
 
-// Simple logger (disabled by default)
-function log(...args: any[]) {
-	// Enable for debugging:
-	// console.log(...args);
-}
-
 export default function (pi: ExtensionAPI) {
-	const globalState = globalThis as Record<PropertyKey, unknown>;
-	if (globalState["pi-llama-metrics-display/loaded"]) return;
-	globalState["pi-llama-metrics-display/loaded"] = true;
+  const globalState = globalThis as Record<PropertyKey, unknown>;
+  if (globalState["pi-llama-metrics-display/loaded"]) return;
+  globalState["pi-llama-metrics-display/loaded"] = true;
 
-	originalFetch = globalThis.fetch;
-	globalThis.fetch = async (input: any, init?: any) => {
-		if (!isLlamaCppRequest(input)) {
-			return originalFetch!(input, init);
-		}
+  originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input: any, init?: any) => {
+    if (!isLlamaCppRequest(input)) {
+      return originalFetch!(input, init);
+    }
 
-		ensureStreamOptions(input, init);
+    ensureStreamOptions(input, init);
 
-		const response = await originalFetch!(input, init);
+    const response = await originalFetch!(input, init);
 
-		if (response.ok && response.body) {
-			return new Response(captureTimings(response.body), {
-				status: response.status,
-				statusText: response.statusText,
-				headers: new Headers(response.headers),
-			});
-		}
-		return response;
-	};
+    if (response.ok && response.body) {
+      return new Response(captureTimings(response.body), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: new Headers(response.headers),
+      });
+    }
+    return response;
+  };
 
-	pi.on("before_agent_start", (_event, ctx) => {
-		uiRef = ctx.ui;
-		hasUIRef = ctx.hasUI;
-	});
+  pi.on("before_agent_start", (_event, ctx) => {
+    uiRef = ctx.ui;
+    hasUIRef = ctx.hasUI;
 
-	pi.on("session_start", async (_event, ctx) => {
-		currentCtx = ctx;
-		currentModelId = ctx.model?.id || null;
-		generatedTokens = 0;
-		generationStartTime = null;
-		latestStreamingMetrics = null;
-	});
+    if (ctx.hasUI) {
+      ctx.ui.setWorkingMessage();
+      // Start of new round, clear status line to avoid showing previous decode value
+      // (prefill phase doesn't display in status line, so it should be empty at this point)
+      if (statusLineVisible) {
+        ctx.ui.setStatus("pi-llama-metrics", undefined);
+      }
+    }
 
-	pi.on("model_select", async (event, ctx) => {
-		currentModelId = event.model?.id || null;
-		lastDisplay = null;
-	});
+    resetGenerationState();
+  });
 
-	pi.on("turn_end", async (_event, ctx) => {
-		if (ctx.hasUI) {
-			ctx.ui.setWorkingMessage();
-		}
-	});
+  pi.on("session_start", async (_event, ctx) => {
+    currentCtx = ctx;
+    currentModelId = ctx.model?.id || null;
+    generatedTokens = 0;
+    resetGenerationState();  // Consistent reset across all state
+  });
 
-	pi.on("session_shutdown", async () => {
-		uiRef = null;
-		hasUIRef = false;
-		rateHistory.length = 0;
-		prevProcessed = 0;
-		prevTimeMs = 0;
-		latestStreamingMetrics = null;
-		lastDisplay = null;
-		currentModelId = null;
-		currentCtx = null;
-		generatedTokens = 0;
-		generationStartTime = null;
+  pi.on("model_select", async (event, ctx) => {
+    currentModelId = event.model?.id || null;
 
-		if (originalFetch) {
-			globalThis.fetch = originalFetch;
-			originalFetch = null;
-		}
+    if (ctx.hasUI && statusLineVisible) {
+      ctx.ui.setStatus("pi-llama-metrics", undefined);
+    }
+    lastDisplay = null;
+    latestStreamingMetrics = null;   // Old model data no longer meaningful
+  });
 
-		delete globalState["pi-llama-metrics-display/loaded"];
-	});
+  pi.on("turn_end", async (_event, ctx) => {
+    if (ctx.hasUI) {
+      // Only clear working message, status line retains decode info
+      ctx.ui.setWorkingMessage();
+    }
+  });
 
-	pi.registerCommand("llama-metrics", {
-		description: "Show llama.cpp metrics widget",
-		handler: async (args, ctx) => {
-			if (!currentModelId) {
-				ctx.ui.notify("No model selected", "warning");
-				return;
-			}
+  pi.on("session_shutdown", async () => {
+    statusLineVisible = true;   // Reset to default visible
+    uiRef = null;
+    hasUIRef = false;
+    generatedTokens = 0;
+    resetGenerationState();
 
-			if (!latestStreamingMetrics) {
-				ctx.ui.notify("No metrics data available. Start generating to see metrics.", "warning");
-				return;
-			}
+    if (originalFetch) {
+      globalThis.fetch = originalFetch;
+      originalFetch = null;
+    }
 
-			const metrics = latestStreamingMetrics;
+    delete globalState["pi-llama-metrics-display/loaded"];
+  });
 
-			ctx.ui.setWidget("llama-metrics-widget", (tui, theme) => {
-				const container = new Container();
-				container.addChild(new Text(`MODEL: ${currentModelId}`, 1, 0));
+  pi.registerCommand("llama-metrics", {
+    description: "Show llama.cpp metrics widget",
+    handler: async (args, ctx) => {
+      if (latestStreamingMetrics?.generationSpeed === undefined) {
+        ctx.ui.notify("No metrics data available. Start generating to see metrics.", "warning");
+        return;
+      }
 
-				if (metrics.prefillSpeed) {
-					container.addChild(new Text(`PREFILL SPEED: ${formatTps(metrics.prefillSpeed)}`, 1, 0));
-				}
-				if (metrics.generationSpeed) {
-					container.addChild(new Text(`GENERATION SPEED: ${formatTps(metrics.generationSpeed)}`, 1, 0));
-				}
-				if (metrics.promptTokens !== undefined) {
-					container.addChild(new Text(`PREFILL TOKENS: ${metrics.promptTokens}`, 1, 0));
-				}
-				if (metrics.generatedTokens !== undefined) {
-					container.addChild(new Text(`GENERATED TOKENS: ${metrics.generatedTokens}`, 1, 0));
-				}
+      const speed = latestStreamingMetrics.generationSpeed;
+      ctx.ui.setWidget("llama-metrics-widget", (tui, theme) => {
+        const container = new Container();
+        // Gray: try using theme API; if not supported, fall back to ANSI
+        const label = `${GRAY}${formatTps(speed)}${RESET}`;
+        container.addChild(new Text(label, 1, 0));
+        return container;
+      });
 
-				return container;
-			});
+      ctx.ui.notify("Metrics widget displayed", "info");
+    },
+  });
 
-			ctx.ui.notify("Metrics widget displayed", "info");
-		},
-	});
+  pi.registerCommand("llama-metrics-toggle", {
+    description: "Toggle llama.cpp metrics in status line",
+    handler: async (args, ctx) => {
+      statusLineVisible = !statusLineVisible;
 
-	pi.registerCommand("llama-metrics-toggle", {
-		description: "Toggle llama.cpp metrics in status line",
-		handler: async (args, ctx) => {
-			if (!currentModelId) {
-				ctx.ui.notify("No model selected", "warning");
-				return;
-			}
-
-			if (!latestStreamingMetrics) {
-				ctx.ui.notify("No metrics data available", "warning");
-				return;
-			}
-
-			if (lastDisplay) {
-				ctx.ui.setStatus("pi-llama-metrics", undefined);
-				lastDisplay = null;
-				ctx.ui.notify("Metrics hidden", "info");
-			} else {
-				updateStatus(ctx, currentModelId, latestStreamingMetrics);
-				ctx.ui.notify("Metrics shown", "info");
-			}
-		},
-	});
+      if (statusLineVisible) {
+        // Re-display if we have data
+        if (latestStreamingMetrics?.generationSpeed !== undefined) {
+          const display = buildDisplayString(latestStreamingMetrics);
+          if (display && display !== lastDisplay && ctx.hasUI) {
+            lastDisplay = display;
+            ctx.ui.setStatus("pi-llama-metrics", display);
+          }
+        }
+        ctx.ui.notify("Metrics shown", "info");
+      } else {
+        ctx.ui.setStatus("pi-llama-metrics", undefined);
+        lastDisplay = null;
+        ctx.ui.notify("Metrics hidden", "info");
+      }
+    },
+  });
 }

@@ -10,6 +10,7 @@ A Pi coding-agent extension that displays real-time metrics from llama.cpp serve
 - **Auto-discovery** - Automatically detects when a llama.cpp model is selected
 - **Status line display** - Shows metrics in the TUI status line
 - **Widget mode** - Optional widget above the editor
+- **Real-time streaming** - No polling delays, updates as events arrive
 
 ## Requirements
 
@@ -105,9 +106,9 @@ Toggle the metrics display in the status line on/off.
 
 ## Metrics Explained
 
-- **⚡ Prefill speed** - Tokens processed per second during prompt analysis
-- **🔥 Generation speed** - Tokens generated per second during response creation
-- **📊 Token counts** - Prompt tokens used / Response tokens generated
+- **⚡ Prefill speed** - Tokens processed per second during prompt analysis (calculated from `prompt_progress` events)
+- **🔥 Generation speed** - Tokens generated per second during response creation (calculated from content deltas)
+- **📊 Token counts** - Total prompt tokens processed / Total tokens generated
 
 ## Debugging
 
@@ -127,6 +128,7 @@ Logs are written to `/tmp/pi-llama-metrics.log`.
 1. Ensure the llama.cpp server is running with `--metrics` flag
 2. Check that the server's base URL matches the one in your Pi configuration
 3. Verify the server is accessible: `curl http://localhost:8080/metrics`
+4. Start generating text - metrics only update during active generation
 
 ### "No llama.cpp model selected"
 
@@ -136,9 +138,10 @@ Logs are written to `/tmp/pi-llama-metrics.log`.
 
 ### Metrics not updating
 
-1. Check that polling is running (look for "Started polling every 2 seconds" in logs)
-2. Verify network connectivity to the llama.cpp server
-3. Ensure no firewall is blocking the metrics endpoint
+1. Ensure the llama.cpp server is actively generating text (metrics only update during activity)
+2. Check that the server is running with `--metrics` flag
+3. Verify network connectivity to the llama.cpp server
+4. Ensure no firewall is blocking the connection
 
 ## Development
 
@@ -152,6 +155,13 @@ pi -e ./index.ts
 ### Building for distribution
 
 This extension is designed to run directly from source. No build step required.
+
+### Testing the SSE parsing logic
+
+```bash
+cd /workspace
+node test-sse-parsing.js  # Verifies SSE event parsing
+```
 
 ### Testing with a local server
 
