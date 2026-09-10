@@ -8,7 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Extension name and destination
-const EXTENSION_NAME = "pi-llama-metrics-display";
+const EXTENSION_NAME = "pi-llama-metrics";
 const HOME_PI_EXTENSIONS = path.join(
   process.env.HOME || process.env.HOMEPATH,
   ".pi",
