@@ -15,6 +15,7 @@ A Pi coding-agent extension that displays real-time metrics from llama.cpp serve
 ## Requirements
 
 1. **llama.cpp server** running with metrics enabled:
+
    ```bash
    llama-server -m path/to/model.gguf --metrics --port 8080
    ```
@@ -166,11 +167,13 @@ node test-sse-parsing.js  # Verifies SSE event parsing
 ### Testing with a local server
 
 1. Start a llama.cpp server:
+
    ```bash
    llama-server -m models/gemma-2b.gguf --metrics --port 8080
    ```
 
 2. Configure Pi to use the local server:
+
    ```json
    {
      "providers": {

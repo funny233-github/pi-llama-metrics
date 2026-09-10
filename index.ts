@@ -5,7 +5,10 @@
  * Shows metrics in status line or widget without polling.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Text, Container } from "@earendil-works/pi-tui";
 
 // ─── Type Definitions ─────────────────────────────────────────────────────────
@@ -38,7 +41,11 @@ interface LlamaCppSSEChunk {
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
-let currentProgress: { total?: number; processed?: number; time_ms?: number } | null = null;
+let currentProgress: {
+  total?: number;
+  processed?: number;
+  time_ms?: number;
+} | null = null;
 let prevProcessed = 0;
 let prevTimeMs = 0;
 let isGenerating = false;
@@ -48,8 +55,8 @@ let hasUIRef = false;
 let originalFetch: typeof fetch | null = null;
 
 // Generation tracking
-let generatedTokens = 0;           // Cumulative tokens across all rounds
-let generationBaseTokens = 0;      // Tokens at start of current generation round
+let generatedTokens = 0; // Cumulative tokens across all rounds
+let generationBaseTokens = 0; // Tokens at start of current generation round
 let generationStartTime: number | null = null;
 
 // Latest metrics for widget
@@ -57,10 +64,10 @@ let latestStreamingMetrics: LlamaMetrics | null = null;
 
 // Window smoothing for real-time TPS
 const windowSizeMs = 1000;
-let tokenWindow: { tokens: number; time: number }[] = [];
-let prefillWindow: { processed: number; time: number }[] = [];
+const tokenWindow: { tokens: number; time: number }[] = [];
+const prefillWindow: { processed: number; time: number }[] = [];
 let usageApplied = false;
-let usageJustApplied = false;  // Flag for first chunk after usage
+let usageJustApplied = false; // Flag for first chunk after usage
 
 interface LlamaMetrics {
   generationSpeed?: number;
@@ -69,24 +76,24 @@ interface LlamaMetrics {
 
 let lastDisplay: string | null = null;
 let currentModelId: string | null = null;
-let statusLineVisible = true;   // Default visible (no toggle needed for decode info)
-let lastPrefillTps = 0;         // For ETA calculation
+let statusLineVisible = true; // Default visible (no toggle needed for decode info)
+let lastPrefillTps = 0; // For ETA calculation
 
 // Reset all state at start of each new request
 function resetGenerationState() {
   isGenerating = false;
   generationStartTime = null;
-  generationBaseTokens = generatedTokens;  // Preserve cumulative, set baseline
+  generationBaseTokens = generatedTokens; // Preserve cumulative, set baseline
   currentProgress = null;
   prevProcessed = 0;
   prevTimeMs = 0;
-  latestStreamingMetrics = null;  // Clear metrics to avoid cross-round contamination
-  lastDisplay = null;             // Clear display cache
-  tokenWindow.length = 0;           // Clear window for new stream
-  prefillWindow.length = 0;         // Clear prefill window
-  usageApplied = false;             // Reset usage flag
-  usageJustApplied = false;         // Reset flag
-  lastPrefillTps = 0;               // Reset ETA calculation basis
+  latestStreamingMetrics = null; // Clear metrics to avoid cross-round contamination
+  lastDisplay = null; // Clear display cache
+  tokenWindow.length = 0; // Clear window for new stream
+  prefillWindow.length = 0; // Clear prefill window
+  usageApplied = false; // Reset usage flag
+  usageJustApplied = false; // Reset flag
+  lastPrefillTps = 0; // Reset ETA calculation basis
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -107,16 +114,16 @@ function estimateTokens(content: string): number {
   for (const char of content) {
     const code = char.codePointAt(0) ?? 0;
     const isCJK =
-      (code >= 0x4e00 && code <= 0x9fff) ||   // CJK Unified Ideographs
-      (code >= 0x3040 && code <= 0x30ff) ||   // Hiragana + Katakana
-      (code >= 0xac00 && code <= 0xd7af) ||   // Hangul
-      (code >= 0x3400 && code <= 0x4dbf) ||   // CJK Extension A
-      (code >= 0x3000 && code <= 0x303f) ||   // ✅ CJK 标点
-      (code >= 0xff00 && code <= 0xffef);     // ✅ 全角字符
+      (code >= 0x4e00 && code <= 0x9fff) || // CJK Unified Ideographs
+      (code >= 0x3040 && code <= 0x30ff) || // Hiragana + Katakana
+      (code >= 0xac00 && code <= 0xd7af) || // Hangul
+      (code >= 0x3400 && code <= 0x4dbf) || // CJK Extension A
+      (code >= 0x3000 && code <= 0x303f) || // CJK punctuation
+      (code >= 0xff00 && code <= 0xffef); // Full-width characters
     if (isCJK) cjk++;
     else other++;
   }
-  // CJK 约 1 字符 1 token，其他约 4 字符 1 token
+  // CJK: ~1 char = 1 token, others: ~4 chars = 1 token
   return Math.max(1, Math.round(cjk + other / 4));
 }
 
@@ -134,7 +141,11 @@ function parseSSEEvent(line: string): LlamaCppSSEChunk | null {
   }
 }
 
-function handleProgressEvent(p: { processed: number; total: number; time_ms: number }) {
+function handleProgressEvent(p: {
+  processed: number;
+  total: number;
+  time_ms: number;
+}) {
   if (currentProgress) {
     prevProcessed = currentProgress.processed ?? 0;
     prevTimeMs = currentProgress.time_ms ?? 0;
@@ -153,9 +164,9 @@ function handleProgressEvent(p: { processed: number; total: number; time_ms: num
         // lastPrefillTps is retained for next ETA usage (though meaningless for this round)
       }
       isGenerating = true;
-      updateWorkingMessage();   // Clear progress bar
+      updateWorkingMessage(); // Clear progress bar
     }
-    return;   // Skip TPS calculation for completion event
+    return; // Skip TPS calculation for completion event
   }
 
   if (!isGenerating) {
@@ -165,7 +176,10 @@ function handleProgressEvent(p: { processed: number; total: number; time_ms: num
       // Window smoothing on llama.cpp internal clock
       prefillWindow.push({ processed: p.processed ?? 0, time: p.time_ms });
       const maxTime = p.time_ms;
-      while (prefillWindow.length > 0 && maxTime - prefillWindow[0].time > windowSizeMs) {
+      while (
+        prefillWindow.length > 0 &&
+        maxTime - prefillWindow[0].time > windowSizeMs
+      ) {
         prefillWindow.shift();
       }
 
@@ -184,7 +198,7 @@ function handleProgressEvent(p: { processed: number; total: number; time_ms: num
       }
 
       lastPrefillTps = tps;
-      updateWorkingMessage();   // Only called once per TPS update (mutually exclusive with prefillDone branch)
+      updateWorkingMessage(); // Only called once per TPS update (mutually exclusive with prefillDone branch)
     }
   }
 }
@@ -194,16 +208,30 @@ function updateWorkingMessage(): void {
   if (!uiRef || !hasUIRef) return;
 
   // Use >= to catch processed > total boundary case
-  if (currentProgress?.total !== undefined && currentProgress.processed !== undefined && currentProgress.processed >= currentProgress.total) {
+  if (
+    currentProgress?.total !== undefined &&
+    currentProgress.processed !== undefined &&
+    currentProgress.processed >= currentProgress.total
+  ) {
     uiRef.setWorkingMessage();
     return;
   }
 
-  if (currentProgress && currentProgress.total && currentProgress.processed !== undefined) {
+  if (
+    currentProgress &&
+    currentProgress.total &&
+    currentProgress.processed !== undefined
+  ) {
     // Clamp percentage to [0, 100] to prevent negative repeat
-    const pct = Math.min(100, Math.max(0, (currentProgress.processed / currentProgress.total) * 100));
-    const barWidth = 12;   // Shrink bar width to make room for speed
-    const filled = Math.min(barWidth, Math.max(0, Math.round((pct / 100) * barWidth)));
+    const pct = Math.min(
+      100,
+      Math.max(0, (currentProgress.processed / currentProgress.total) * 100),
+    );
+    const barWidth = 12; // Shrink bar width to make room for speed
+    const filled = Math.min(
+      barWidth,
+      Math.max(0, Math.round((pct / 100) * barWidth)),
+    );
     const bar = "█".repeat(filled) + "░".repeat(barWidth - filled);
 
     // Speed string
@@ -215,7 +243,10 @@ function updateWorkingMessage(): void {
     // ETA calculation with clamped remaining
     let etaStr = "";
     if (lastPrefillTps > 0) {
-      const remaining = Math.max(0, currentProgress.total - currentProgress.processed);
+      const remaining = Math.max(
+        0,
+        currentProgress.total - currentProgress.processed,
+      );
       const etaSec = remaining / lastPrefillTps;
       if (etaSec < 60) {
         etaStr = ` ETA: ${etaSec.toFixed(1)}s`;
@@ -226,7 +257,9 @@ function updateWorkingMessage(): void {
       }
     }
 
-    uiRef.setWorkingMessage(`PREFILL: ${bar} ${pct.toFixed(0).padStart(3)}%${speedStr}${etaStr}`);
+    uiRef.setWorkingMessage(
+      `PREFILL: ${bar} ${pct.toFixed(0).padStart(3)}%${speedStr}${etaStr}`,
+    );
   } else {
     uiRef.setWorkingMessage();
   }
@@ -239,9 +272,9 @@ function handleCompletionText(content: string) {
 
   // Track generation start time on first token (avoid first-token latency)
   if (!generationStartTime) {
-    isGenerating = true;  // Double insurance: mark as generating even without prefill events
+    isGenerating = true; // Double insurance: mark as generating even without prefill events
     generationStartTime = Date.now();
-    generationBaseTokens = generatedTokens - tokens;  // Baseline for this round
+    generationBaseTokens = generatedTokens - tokens; // Baseline for this round
   }
 
   // First chunk after usage: only reset window baseline, don't calculate TPS
@@ -286,21 +319,22 @@ function handleCompletionText(content: string) {
   if (currentCtx) {
     const metrics: LlamaMetrics = {
       generationSpeed: smoothedTps,
-      lastUpdate: now
+      lastUpdate: now,
     };
     updateStatus(currentCtx, metrics);
   }
-
 }
 
-function captureTimings(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+function captureTimings(
+  body: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   let buffer = "";
   const decoder = new TextDecoder();
 
   return new ReadableStream({
     async start(controller) {
-      // ✅ Reset generation state for each new response stream (handles multiple requests per round)
+      // Reset generation state for each new response stream (handles multiple requests per round)
       resetGenerationState();
 
       while (true) {
@@ -327,15 +361,24 @@ function captureTimings(body: ReadableStream<Uint8Array>): ReadableStream<Uint8A
               let combined = "";
 
               // 1. Text output
-              if (typeof delta.content === "string" && delta.content.length > 0) {
+              if (
+                typeof delta.content === "string" &&
+                delta.content.length > 0
+              ) {
                 combined += delta.content;
               }
 
               // 2. Thinking/reasoning content (DeepSeek-R1, QwQ, etc.)
-              if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+              if (
+                typeof delta.reasoning_content === "string" &&
+                delta.reasoning_content.length > 0
+              ) {
                 combined += delta.reasoning_content;
               }
-              if (typeof delta.reasoning === "string" && delta.reasoning.length > 0) {
+              if (
+                typeof delta.reasoning === "string" &&
+                delta.reasoning.length > 0
+              ) {
                 combined += delta.reasoning;
               }
 
@@ -364,7 +407,7 @@ function captureTimings(body: ReadableStream<Uint8Array>): ReadableStream<Uint8A
           // Use real token count from usage event for accuracy (only once)
           if (!usageApplied && chunk.usage?.completion_tokens !== undefined) {
             usageApplied = true;
-            usageJustApplied = true;  // Mark first chunk after usage
+            usageJustApplied = true; // Mark first chunk after usage
             const realRoundTokens = chunk.usage.completion_tokens;
 
             // 1. First calculate final average TPS for this round using old baseline + real value
@@ -417,16 +460,18 @@ function isLlamaCppRequest(input: any): boolean {
   if (!url.includes("/chat/completions")) return false;
 
   if (!llamaCppUrl) {
-    let hostPart = url.replace(/https?:\/\//, "").split("/")[0];
+    const hostPart = url.replace(/https?:\/\//, "").split("/")[0];
     llamaCppUrl = `http://${hostPart}/v1`;
   }
 
-  return url.includes(llamaCppUrl.replace(/https?:\/\//, "").replace(/^\/+/, ""));
+  return url.includes(
+    llamaCppUrl.replace(/https?:\/\//, "").replace(/^\/+/, ""),
+  );
 }
 
 function ensureStreamOptions(input: any, init?: any): void {
   try {
-    let body = init?.body;
+    const body = init?.body;
     if (!body) return;
 
     const isString = typeof body === "string";
@@ -527,7 +572,7 @@ export default function (pi: ExtensionAPI) {
     currentCtx = ctx;
     currentModelId = ctx.model?.id || null;
     generatedTokens = 0;
-    resetGenerationState();  // Consistent reset across all state
+    resetGenerationState(); // Consistent reset across all state
   });
 
   pi.on("model_select", async (event, ctx) => {
@@ -537,7 +582,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("pi-llama-metrics", undefined);
     }
     lastDisplay = null;
-    latestStreamingMetrics = null;   // Old model data no longer meaningful
+    latestStreamingMetrics = null; // Old model data no longer meaningful
   });
 
   pi.on("turn_end", async (_event, ctx) => {
@@ -548,7 +593,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    statusLineVisible = true;   // Reset to default visible
+    statusLineVisible = true; // Reset to default visible
     uiRef = null;
     hasUIRef = false;
     generatedTokens = 0;
@@ -566,7 +611,10 @@ export default function (pi: ExtensionAPI) {
     description: "Show llama.cpp metrics widget",
     handler: async (args, ctx) => {
       if (latestStreamingMetrics?.generationSpeed === undefined) {
-        ctx.ui.notify("No metrics data available. Start generating to see metrics.", "warning");
+        ctx.ui.notify(
+          "No metrics data available. Start generating to see metrics.",
+          "warning",
+        );
         return;
       }
 
