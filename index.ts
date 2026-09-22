@@ -75,7 +75,6 @@ interface LlamaMetrics {
 }
 
 let lastDisplay: string | null = null;
-let currentModelId: string | null = null;
 let statusLineVisible = true; // Default visible (no toggle needed for decode info)
 let lastPrefillTps = 0; // For ETA calculation
 
@@ -454,22 +453,57 @@ function captureTimings(
 
 // ─── Fetch Interception ──────────────────────────────────────────────────────
 
+// Normalize a URL to scheme://host/path (keeps path prefixes like /v1,
+// drops a trailing slash). Used to compare the request URL against the
+// configured provider baseUrl without guessing the shape.
+function normalizeUrlBase(u: string): string {
+  try {
+    const url = new URL(u);
+    return `${url.protocol}//${url.host}${url.pathname}`.replace(/\/$/, "");
+  } catch {
+    return u.replace(/\/$/, "");
+  }
+}
+
 function isLlamaCppRequest(input: any): boolean {
   const url = typeof input === "string" ? input : input?.url;
   if (typeof url !== "string") return false;
   if (!url.includes("/chat/completions")) return false;
 
-  if (!llamaCppUrl) {
-    const hostPart = url.replace(/https?:\/\//, "").split("/")[0];
-    llamaCppUrl = `http://${hostPart}/v1`;
+  // Prefer the configured provider baseUrl of the current model. This is the
+  // source of truth for the request URL and avoids the old "learn once from
+  // the first request" bug (which also hardcoded /v1 and broke when the
+  // baseUrl had no /v1 or when the server was switched).
+  const configuredBase = currentModel?.baseUrl;
+  if (configuredBase) {
+    const reqBase = normalizeUrlBase(url);
+    const cfgBase = normalizeUrlBase(configuredBase);
+
+    // Match on origin + path prefix, with a path boundary so that
+    // http://host/abc does not accidentally match http://host/abcd.
+    if (reqBase === cfgBase || reqBase.startsWith(cfgBase + "/")) {
+      return true;
+    }
+
+    // Fall back to a host-only match: the endpoint path may differ from the
+    // configured baseUrl (e.g. baseUrl without /v1), but it's still the same
+    // llama.cpp server.
+    const reqHost = `${new URL(reqBase).protocol}//${new URL(reqBase).host}`;
+    const cfgHost = `${new URL(cfgBase).protocol}//${new URL(cfgBase).host}`;
+    return reqHost === cfgHost;
   }
 
-  return url.includes(
-    llamaCppUrl.replace(/https?:\/\//, "").replace(/^\/+/, ""),
-  );
+  // Fallback: derive from the request itself. Reset per session (see
+  // session_start / model_select) so it re-detects instead of freezing on
+  // the first request.
+  if (!llamaCppUrl) {
+    const hostPart = url.replace(/https?:\/\//, "").split("/")[0];
+    llamaCppUrl = `http://${hostPart}`;
+  }
+  return url.includes(llamaCppUrl.replace(/https?:\/\//, ""));
 }
 
-function ensureStreamOptions(input: any, init?: any): void {
+function ensureStreamOptions(init?: any): void {
   try {
     const body = init?.body;
     if (!body) return;
@@ -526,6 +560,10 @@ function updateStatus(ctx: ExtensionContext, metrics: LlamaMetrics) {
 
 let currentCtx: ExtensionContext | null = null;
 let llamaCppUrl: string | null = null;
+// Current model, used to detect llama.cpp requests via its configured baseUrl.
+// Reset on session_start / model_select so detection re-derives instead of
+// freezing on the first request.
+let currentModel: any = null;
 
 export default function (pi: ExtensionAPI) {
   const globalState = globalThis as Record<PropertyKey, unknown>;
@@ -538,7 +576,7 @@ export default function (pi: ExtensionAPI) {
       return originalFetch!(input, init);
     }
 
-    ensureStreamOptions(input, init);
+    ensureStreamOptions(init);
 
     const response = await originalFetch!(input, init);
 
@@ -570,19 +608,21 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
-    currentModelId = ctx.model?.id || null;
+    currentModel = ctx.model ?? null;
     generatedTokens = 0;
+    llamaCppUrl = null; // Re-derive detection base for this session
     resetGenerationState(); // Consistent reset across all state
   });
 
   pi.on("model_select", async (event, ctx) => {
-    currentModelId = event.model?.id || null;
+    currentModel = ctx.model ?? event.model ?? null;
 
     if (ctx.hasUI && statusLineVisible) {
       ctx.ui.setStatus("pi-llama-metrics", undefined);
     }
     lastDisplay = null;
     latestStreamingMetrics = null; // Old model data no longer meaningful
+    llamaCppUrl = null; // Server may have changed with the model
   });
 
   pi.on("turn_end", async (_event, ctx) => {
@@ -609,7 +649,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("llama-metrics", {
     description: "Show llama.cpp metrics widget",
-    handler: async (args, ctx) => {
+    handler: async (_args, ctx) => {
       if (latestStreamingMetrics?.generationSpeed === undefined) {
         ctx.ui.notify(
           "No metrics data available. Start generating to see metrics.",
@@ -619,7 +659,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const speed = latestStreamingMetrics.generationSpeed;
-      ctx.ui.setWidget("llama-metrics-widget", (tui, theme) => {
+      ctx.ui.setWidget("llama-metrics-widget", () => {
         const container = new Container();
         // Gray: try using theme API; if not supported, fall back to ANSI
         const label = `${GRAY}${formatTps(speed)}${RESET}`;
@@ -633,7 +673,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("llama-metrics-toggle", {
     description: "Toggle llama.cpp metrics in status line",
-    handler: async (args, ctx) => {
+    handler: async (_args, ctx) => {
       statusLineVisible = !statusLineVisible;
 
       if (statusLineVisible) {
