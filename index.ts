@@ -453,15 +453,16 @@ function captureTimings(
 
 // ─── Fetch Interception ──────────────────────────────────────────────────────
 
-// Normalize a URL to scheme://host/path (keeps path prefixes like /v1,
-// drops a trailing slash). Used to compare the request URL against the
-// configured provider baseUrl without guessing the shape.
-function normalizeUrlBase(u: string): string {
+// Extract scheme://host (the request origin) from a URL, tolerant of
+// malformed input. Path, query and trailing slashes are ignored so that
+// requests to the same server match regardless of /v1 or endpoint path.
+function requestOrigin(url: string): string {
   try {
-    const url = new URL(u);
-    return `${url.protocol}//${url.host}${url.pathname}`.replace(/\/$/, "");
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}`;
   } catch {
-    return u.replace(/\/$/, "");
+    const m = url.match(/^[a-z]+:\/\/[^/]+/i);
+    return m ? m[0] : url;
   }
 }
 
@@ -470,37 +471,25 @@ function isLlamaCppRequest(input: any): boolean {
   if (typeof url !== "string") return false;
   if (!url.includes("/chat/completions")) return false;
 
-  // Prefer the configured provider baseUrl of the current model. This is the
-  // source of truth for the request URL and avoids the old "learn once from
-  // the first request" bug (which also hardcoded /v1 and broke when the
-  // baseUrl had no /v1 or when the server was switched).
-  const configuredBase = currentModel?.baseUrl;
-  if (configuredBase) {
-    const reqBase = normalizeUrlBase(url);
-    const cfgBase = normalizeUrlBase(configuredBase);
+  const reqOrigin = requestOrigin(url);
 
-    // Match on origin + path prefix, with a path boundary so that
-    // http://host/abc does not accidentally match http://host/abcd.
-    if (reqBase === cfgBase || reqBase.startsWith(cfgBase + "/")) {
-      return true;
-    }
-
-    // Fall back to a host-only match: the endpoint path may differ from the
-    // configured baseUrl (e.g. baseUrl without /v1), but it's still the same
-    // llama.cpp server.
-    const reqHost = `${new URL(reqBase).protocol}//${new URL(reqBase).host}`;
-    const cfgHost = `${new URL(cfgBase).protocol}//${new URL(cfgBase).host}`;
-    return reqHost === cfgHost;
-  }
-
-  // Fallback: derive from the request itself. Reset per session (see
-  // session_start / model_select) so it re-detects instead of freezing on
-  // the first request.
+  // Learn the server origin from the first request of the session, before any
+  // early return, so subsequent requests can be matched against it. Reset on
+  // session_start / model_select (see below) so it re-detects instead of
+  // freezing on the first request. Learning from the request itself is robust
+  // to baseUrl / request host spelling differences (localhost vs 127.0.0.1)
+  // and to /v1 path variations, which a baseUrl-only match would break.
   if (!llamaCppUrl) {
-    const hostPart = url.replace(/https?:\/\//, "").split("/")[0];
-    llamaCppUrl = `http://${hostPart}`;
+    llamaCppUrl = reqOrigin;
   }
-  return url.includes(llamaCppUrl.replace(/https?:\/\//, ""));
+
+  // Accept the configured provider baseUrl's origin when it is available.
+  const configuredBase = currentModel?.baseUrl;
+  if (configuredBase && requestOrigin(configuredBase) === reqOrigin) {
+    return true;
+  }
+
+  return llamaCppUrl === reqOrigin;
 }
 
 function ensureStreamOptions(init?: any): void {
@@ -559,10 +548,11 @@ function updateStatus(ctx: ExtensionContext, metrics: LlamaMetrics) {
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 let currentCtx: ExtensionContext | null = null;
+// Server origin (scheme://host) learned from the first request of the
+// session. Reset on session_start / model_select so detection re-derives
+// instead of freezing on the first request.
 let llamaCppUrl: string | null = null;
 // Current model, used to detect llama.cpp requests via its configured baseUrl.
-// Reset on session_start / model_select so detection re-derives instead of
-// freezing on the first request.
 let currentModel: any = null;
 
 export default function (pi: ExtensionAPI) {
