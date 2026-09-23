@@ -466,30 +466,54 @@ function requestOrigin(url: string): string {
   }
 }
 
-function isLlamaCppRequest(input: any): boolean {
+// Cache of server origin -> whether it exposes llama.cpp metrics at /metrics.
+// A server's metrics capability does not change per session, so cache for the
+// lifetime of the process to avoid re-probing on every request.
+const metricsCache = new Map<string, boolean>();
+
+// Matches llama.cpp metrics across build generations:
+//  - modern builds (b7191+): the `llamacpp:` namespace (e.g. llamacpp:prompt_tokens_total)
+//  - older builds: `llama.prompt.tokens.total` / `llama.response.tokens.total`
+// Both are llama.cpp-specific, so non-llama /metrics endpoints (OpenAI, etc.)
+// do not match.
+const LLAMA_METRICS_RE = /llamacpp:|llama\.(prompt|response)\.tokens\.total|llama\.request\./;
+
+// Probe <origin>/metrics once per server and remember whether it exposes
+// llama.cpp metrics. Uses originalFetch so the probe never re-enters the
+// interceptor. The endpoint is off by default (HTTP 501 without --metrics),
+// so a server that did not start with --metrics is correctly treated as
+// non-metrics.
+async function supportsLlamaMetrics(origin: string): Promise<boolean> {
+  const cached = metricsCache.get(origin);
+  if (cached !== undefined) return cached;
+
+  let supported = false;
+  try {
+    const res = await originalFetch?.(`${origin}/metrics`, {
+      method: "GET",
+    });
+    if (res && res.ok && res.body) {
+      const text = await res.text();
+      supported = LLAMA_METRICS_RE.test(text);
+    }
+  } catch {
+    supported = false;
+  }
+
+  metricsCache.set(origin, supported);
+  return supported;
+}
+
+async function isLlamaCppRequest(input: any): Promise<boolean> {
   const url = typeof input === "string" ? input : input?.url;
   if (typeof url !== "string") return false;
   if (!url.includes("/chat/completions")) return false;
 
-  const reqOrigin = requestOrigin(url);
-
-  // Learn the server origin from the first request of the session, before any
-  // early return, so subsequent requests can be matched against it. Reset on
-  // session_start / model_select (see below) so it re-detects instead of
-  // freezing on the first request. Learning from the request itself is robust
-  // to baseUrl / request host spelling differences (localhost vs 127.0.0.1)
-  // and to /v1 path variations, which a baseUrl-only match would break.
-  if (!llamaCppUrl) {
-    llamaCppUrl = reqOrigin;
-  }
-
-  // Accept the configured provider baseUrl's origin when it is available.
-  const configuredBase = currentModel?.baseUrl;
-  if (configuredBase && requestOrigin(configuredBase) === reqOrigin) {
-    return true;
-  }
-
-  return llamaCppUrl === reqOrigin;
+  // Auto-detect the server: only intercept origins that actually expose the
+  // llama.cpp /metrics endpoint. This works for a local llama-server --metrics
+  // and any compatible relay/cloud endpoint, and ignores providers without
+  // llama metrics — no host or URL hard-coding required.
+  return supportsLlamaMetrics(requestOrigin(url));
 }
 
 function ensureStreamOptions(init?: any): void {
@@ -548,12 +572,6 @@ function updateStatus(ctx: ExtensionContext, metrics: LlamaMetrics) {
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 let currentCtx: ExtensionContext | null = null;
-// Server origin (scheme://host) learned from the first request of the
-// session. Reset on session_start / model_select so detection re-derives
-// instead of freezing on the first request.
-let llamaCppUrl: string | null = null;
-// Current model, used to detect llama.cpp requests via its configured baseUrl.
-let currentModel: any = null;
 
 export default function (pi: ExtensionAPI) {
   const globalState = globalThis as Record<PropertyKey, unknown>;
@@ -562,7 +580,7 @@ export default function (pi: ExtensionAPI) {
 
   originalFetch = globalThis.fetch;
   globalThis.fetch = async (input: any, init?: any) => {
-    if (!isLlamaCppRequest(input)) {
+    if (!(await isLlamaCppRequest(input))) {
       return originalFetch!(input, init);
     }
 
@@ -598,21 +616,19 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
-    currentModel = ctx.model ?? null;
     generatedTokens = 0;
-    llamaCppUrl = null; // Re-derive detection base for this session
     resetGenerationState(); // Consistent reset across all state
   });
 
-  pi.on("model_select", async (event, ctx) => {
-    currentModel = ctx.model ?? event.model ?? null;
-
+  pi.on("model_select", async (_event, ctx) => {
+    // Detection is per origin (see isLlamaCppRequest / supportsLlamaMetrics),
+    // so switching to a model on a different server is handled automatically
+    // via a fresh /metrics probe; nothing to reset here.
     if (ctx.hasUI && statusLineVisible) {
       ctx.ui.setStatus("pi-llama-metrics", undefined);
     }
     lastDisplay = null;
     latestStreamingMetrics = null; // Old model data no longer meaningful
-    llamaCppUrl = null; // Server may have changed with the model
   });
 
   pi.on("turn_end", async (_event, ctx) => {
